@@ -1,0 +1,87 @@
+flowchart LR
+%% Flink -> Iceberg ingestion and upsert/CDC architecture (Flink 2.3 module, IcebergSink / SinkV2)
+%% Companion write-up: flink-upsert-ingestion-logic.md (same folder)
+%% ---
+%% How to read it, left to right:
+%%  1. A CDC or upsert source emits RowData tagged with a RowKind (+I, -U, +U, -D).
+%%  2. Flink SQL routes through IcebergTableSink. It builds IcebergSink when
+%%     table.exec.iceberg.use-v2-sink=true, else the legacy FlinkSink (same writer core).
+%%  3. distributeDataStream keyBy's rows on equality fields (or partition key) so every
+%%     version of a primary key reaches the SAME writer subtask. Required for correctness.
+%%  4. IcebergSinkWriter -> RowDataTaskWriterFactory picks the TaskWriter:
+%%     no equality fields = plain append writer; with equality fields = delta writer.
+%%  5. BaseDeltaTaskWriter.write switches on RowKind and calls write / delete / deleteKey
+%%     on BaseEqualityDeltaWriter (core module).
+%%  6. BaseEqualityDeltaWriter keeps insertedRowMap (key -> file path + row offset) for rows
+%%     written in THIS checkpoint:
+%%       key seen this checkpoint      -> position delete (V2 pos-delete file, V3 deletion vector)
+%%       key not seen this checkpoint  -> equality delete file (key columns only in upsert mode)
+%%  7. On checkpoint, prepareCommit returns a WriteResult (data files + delete files).
+%%     IcebergWriteAggregator (parallelism 1) writes them into temporary manifests per checkpoint.
+%%  8. IcebergCommitter commits after the checkpoint completes: AppendFiles if no deletes,
+%%     otherwise one RowDelta per checkpoint, in order, tagging the snapshot with
+%%     flink.max-committed-checkpoint-id / flink.job-id / flink.operator-id for exactly-once.
+%%  9. Maintenance (TableMaintenance / RewriteDataFiles / ConvertEqualityDeletes) runs later to
+%%     fold equality deletes and small files back into data files.
+
+
+    subgraph SRC["1 · Source"]
+        CDC["CDC source<br/>(Flink CDC: MySQL / Postgres binlog, Kafka debezium)<br/>emits +I / -U / +U / -D"]
+        UPS["Upsert source<br/>(Kafka upsert, INSERT INTO ... with PRIMARY KEY)<br/>emits +I / +U / -D"]
+    end
+
+    subgraph ENTRY["2 · Entry point"]
+        SQL["IcebergTableSink<br/>getChangelogMode accepts all RowKinds<br/>PRIMARY KEY -> equalityFieldColumns"]
+        DS["DataStream API<br/>IcebergSink.forRowData(stream)<br/>.equalityFieldColumns(...).upsert(true)"]
+        CFG["Config<br/>write.upsert.enabled / upsert-enabled<br/>format-version 2 or 3<br/>table.exec.iceberg.use-v2-sink"]
+    end
+
+    subgraph DIST["3 · Distribution (IcebergSink.distributeDataStream)"]
+        KEY["keyBy EqualityFieldKeySelector<br/>or PartitionKeySelector (HASH, partition cols in key)<br/>same key -> same writer subtask"]
+    end
+
+    subgraph WRITER["4-6 · Writer subtasks (parallel)"]
+        SW["IcebergSinkWriter<br/>write(row) / prepareCommit()"]
+        FAC["RowDataTaskWriterFactory.create()<br/>useDv = formatVersion > 2"]
+        APP["Append writers<br/>(Unpartitioned / RowDataPartitionedFanoutWriter)<br/>no equality fields"]
+        DELTA["BaseDeltaTaskWriter.write(row)<br/>Unpartitioned / PartitionedDeltaWriter<br/>switch on RowKind"]
+        EQW["BaseEqualityDeltaWriter (core)<br/>insertedRowMap: key -> path + offset"]
+        DF[("Data files<br/>Parquet / ORC / Avro")]
+        PD[("Position deletes<br/>V2: pos-delete file<br/>V3: deletion vector (Puffin)")]
+        ED[("Equality delete files<br/>upsert: key columns only")]
+    end
+
+    subgraph COMMIT["7-8 · Commit path"]
+        AGG["IcebergWriteAggregator (parallelism 1)<br/>prepareSnapshotPreBarrier<br/>writes temp manifests per checkpoint"]
+        CMT["IcebergCommitter<br/>after checkpoint completes<br/>AppendFiles or RowDelta per checkpoint"]
+        TBL[("Iceberg table<br/>new snapshot<br/>flink.max-committed-checkpoint-id")]
+    end
+
+    subgraph MAINT["9 · Maintenance (async)"]
+        TM["TableMaintenance<br/>ConvertEqualityDeletes, RewriteDataFiles<br/>ExpireSnapshots, DeleteOrphanFiles"]
+    end
+
+    CDC --> SQL
+    UPS --> SQL
+    CDC --> DS
+    UPS --> DS
+    CFG -.-> SQL
+    CFG -.-> DS
+    SQL --> KEY
+    DS --> KEY
+    KEY --> SW
+    SW --> FAC
+    FAC -->|"no equality fields"| APP
+    FAC -->|"equality fields set"| DELTA
+    APP --> DF
+    DELTA -->|"+I / +U: deleteKey if upsert, then write"| EQW
+    DELTA -->|"-U: delete (skipped in upsert)"| EQW
+    DELTA -->|"-D: deleteKey (upsert) or delete"| EQW
+    EQW -->|"write(row)"| DF
+    EQW -->|"key written earlier this checkpoint"| PD
+    EQW -->|"key from an earlier checkpoint"| ED
+    SW -->|"WriteResult on checkpoint barrier"| AGG
+    AGG -->|"IcebergCommittable (manifest bytes)"| CMT
+    CMT --> TBL
+    TBL -.-> TM
+    TM -.->|"rewrite / compact"| TBL

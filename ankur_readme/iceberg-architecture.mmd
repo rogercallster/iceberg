@@ -1,0 +1,88 @@
+flowchart LR
+%% Apache Iceberg table format: layered architecture (left to right)
+%% Companion write-up: how-iceberg-and-flink-cdc-work.md (Part 1)
+%% ---
+%% Layers:
+%%  Engines   - Spark, Flink, Trino, ... talk to Iceberg through the Java API (Table, Scan, RowDelta ...)
+%%  Catalog   - maps a table name to the CURRENT metadata.json; the only mutable pointer in the system
+%%  Metadata  - immutable files: metadata.json -> manifest list (per snapshot) -> manifests -> files
+%%  Data      - immutable Parquet/ORC/Avro data files + delete files (position, equality, deletion vectors)
+%% Commit = write new files, then atomically swap the catalog pointer (optimistic concurrency, retry on conflict)
+%% Read   = load metadata.json, pick snapshot, prune manifests by partition stats, prune files by column stats
+
+    subgraph ENG["Engines and API"]
+        direction TB
+        SPARK["Spark<br/>SQL / DataFrame<br/>MERGE, UPDATE, DELETE"]
+        FLINK["Flink<br/>streaming + batch<br/>IcebergSink, FlinkSource"]
+        OTHER["Trino / Hive / Dremio /<br/>PyIceberg / Snowflake ..."]
+        API["Iceberg Java API (api/, core/)<br/>Table · TableScan · Transaction<br/>AppendFiles · RowDelta · OverwriteFiles<br/>RewriteFiles · ExpireSnapshots"]
+        SPARK --> API
+        FLINK --> API
+        OTHER --> API
+    end
+
+    subgraph CAT["Catalog layer"]
+        direction TB
+        CATIF["Catalog interface<br/>loadTable / createTable / dropTable<br/>BaseMetastoreCatalog"]
+        IMPL["Implementations<br/>REST · Hive Metastore · Glue<br/>JDBC · Nessie · Hadoop"]
+        PTR[("Table pointer<br/>db.orders -> s3://.../metadata/<br/>v42.metadata.json")]
+        OPS["TableOperations<br/>current() / refresh()<br/>commit(base, new): atomic CAS"]
+        CATIF --> IMPL
+        IMPL --> PTR
+        IMPL --> OPS
+    end
+
+    subgraph META["Metadata layer (immutable files)"]
+        direction TB
+        MJ["metadata.json (TableMetadata)<br/>format-version 1/2/3<br/>schemas · partition specs · sort orders<br/>properties · snapshot log · refs (main, branches, tags)<br/>last-sequence-number · current-snapshot-id"]
+        SNAP["Snapshot<br/>snapshot-id · parent-id · sequence-number<br/>operation (append / overwrite / delete / replace)<br/>summary: added-data-files, added-dvs, ...<br/>flink.max-committed-checkpoint-id"]
+        ML["Manifest list (snap-*.avro)<br/>one entry per manifest:<br/>path · content (DATA / DELETES)<br/>partition summaries (lower/upper)<br/>added/existing/deleted counts"]
+        MD["Data manifests (*.avro)<br/>entry per data file:<br/>status ADDED/EXISTING/DELETED<br/>data sequence number · partition tuple<br/>column stats: counts, nulls, lower/upper"]
+        MDEL["Delete manifests (*.avro)<br/>entry per delete file:<br/>content POSITION / EQUALITY<br/>equality_ids · referenced data file (DV)"]
+        MJ --> SNAP
+        SNAP --> ML
+        ML --> MD
+        ML --> MDEL
+    end
+
+    subgraph DATA["Data layer (immutable files in object storage)"]
+        direction TB
+        DF[("Data files<br/>Parquet / ORC / Avro<br/>rows of one partition")]
+        PDEL[("Position delete files (v2)<br/>file_path + pos<br/>rows to drop from a data file")]
+        DV[("Deletion vectors (v3)<br/>Puffin blob, roaring bitmap<br/>one per data file")]
+        EQ[("Equality delete files (v2+)<br/>key column values<br/>drop rows matching key<br/>with lower sequence number")]
+        PUF[("Puffin stats files<br/>NDV sketches (theta)")]
+    end
+
+    subgraph STORE["Storage / FileIO"]
+        direction TB
+        FIO["FileIO<br/>S3FileIO · GCSFileIO · ADLSFileIO<br/>HadoopFileIO · ResolvingFileIO"]
+        OBJ[("Object store / HDFS<br/>s3://warehouse/db/orders/<br/>data/ · metadata/")]
+        FIO --> OBJ
+    end
+
+    subgraph RW["How reads and writes use the layers"]
+        direction TB
+        READ["Read / scan planning<br/>1 load current metadata.json<br/>2 pick snapshot (or time travel)<br/>3 prune manifests by partition summaries<br/>4 prune files by column stats<br/>5 attach applicable delete files<br/>6 FileScanTask per file split"]
+        WRITE["Write / commit<br/>1 write data + delete files<br/>2 write new manifests<br/>3 write manifest list + new snapshot<br/>4 write new metadata.json<br/>5 CAS catalog pointer old -> new<br/>6 on conflict: refresh, re-validate, retry"]
+        MAINT["Maintenance<br/>rewrite_data_files (compaction)<br/>rewrite_position_delete_files<br/>rewrite_manifests · expire_snapshots<br/>remove_orphan_files"]
+    end
+
+    API -->|"loadTable(name)"| CATIF
+    OPS -->|"read / write"| MJ
+    PTR -.->|"points to current"| MJ
+    MD -->|"tracks"| DF
+    MDEL -->|"tracks"| PDEL
+    MDEL -->|"tracks"| DV
+    MDEL -->|"tracks"| EQ
+    MJ -.->|"statistics"| PUF
+    DF --> FIO
+    PDEL --> FIO
+    DV --> FIO
+    EQ --> FIO
+    API --> READ
+    API --> WRITE
+    API --> MAINT
+    WRITE -->|"commit(base, new)"| OPS
+    READ -->|"current()"| OPS
+    MAINT -->|"replace snapshot"| OPS

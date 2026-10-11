@@ -1,0 +1,80 @@
+flowchart LR
+%% Why Flink upsert "creates a delete file per row" at scale
+%% Companion write-up: deletion-vectors-and-flink-upsert.md (Part 2)
+%% ---
+%% Measured on this repo (RowDataTaskWriterFactory, upsert=true, Parquet, one writer):
+%%   10,000 upserts of new keys, 100 partitions -> 100 data files, 100 eq-delete files, 10,000 eq-delete ROWS
+%% Facts:
+%%  - Upsert issues deleteKey(key) for EVERY +I/+U -> 1 equality-delete ROW per input row (unless key seen this checkpoint)
+%%  - Each writer subtask keeps one RowDataDeltaWriter PER PARTITION, each with its own eq-delete file
+%%  - Default write.distribution-mode = none -> keyBy(primary key) -> every subtask sees every partition
+%%  - So per checkpoint: eq-delete FILES = subtasks x partitions touched; rows per file = rows / that product
+%%  - Files are only closed at the checkpoint -> files accumulate per checkpoint until compaction
+
+    subgraph IN["Input per checkpoint"]
+        direction TB
+        SRC["Upsert stream<br/>R rows per checkpoint<br/>e.g. R = 50,000"]
+    end
+
+    subgraph KEY["Default: write.distribution-mode = none"]
+        direction TB
+        KB["keyBy(EqualityFieldKeySelector)<br/>hash(primary key) mod N<br/>keys spread over ALL subtasks<br/>each subtask gets rows of ALL partitions"]
+    end
+
+    subgraph SUBS["N writer subtasks (e.g. N = 32)"]
+        direction TB
+        subgraph S1["Subtask 1 · PartitionedDeltaWriter"]
+            direction TB
+            S1P1["RowDataDeltaWriter p=2026-10-01<br/>data file + eq-delete file"]
+            S1P2["RowDataDeltaWriter p=2026-10-02<br/>data file + eq-delete file"]
+            S1PX["... one per partition touched (P)"]
+        end
+        subgraph S2["Subtask 2"]
+            direction TB
+            S2P1["p=2026-10-01: data + eq-delete"]
+            S2PX["... P partitions"]
+        end
+        SN["Subtask N<br/>... P partitions"]
+    end
+
+    subgraph ROW["Per row inside one RowDataDeltaWriter (upsert)"]
+        direction TB
+        INS["+I / +U (id=k)"]
+        CHK{"k in insertedRowMap?<br/>(written earlier this checkpoint)"}
+        POS["position delete<br/>v2: pos-delete file per data file<br/>v3: DV bitmap, shared Puffin"]
+        EQ["equality delete ROW {k}<br/>-> this partition's eq-delete file"]
+        WR["write row to data file<br/>insertedRowMap.put(k)"]
+        INS --> CHK
+        CHK -->|"yes"| POS
+        CHK -->|"no (new key or older checkpoint)"| EQ
+        POS --> WR
+        EQ --> WR
+    end
+
+    subgraph RES["Result per checkpoint"]
+        direction TB
+        CNT["eq-delete files ≈ N x P<br/>32 x 1,000 = 32,000 files<br/>rows per file ≈ R / (N x P)<br/>50,000 / 32,000 ≈ 1.6 rows per file"]
+        ACC["Accumulates every checkpoint<br/>1-min checkpoints x 1 h = 60 commits<br/>≈ 1.9 M eq-delete files / hour<br/>each applied to every older data file in its partition"]
+        CNT --> ACC
+    end
+
+    subgraph FIX["Levers"]
+        direction TB
+        F1["write.distribution-mode = hash<br/>with partition cols in PRIMARY KEY<br/>-> keyBy(partition): files ≈ P, not N x P"]
+        F2["Turn upsert OFF when the source emits<br/>a real changelog (-U/-D)<br/>-> no delete on plain inserts"]
+        F3["Longer checkpoint interval<br/>fewer, larger files per commit"]
+        F4["Maintenance: ConvertEqualityDeletes -> DVs<br/>then RewriteDataFiles"]
+    end
+
+    SRC --> KB
+    KB --> S1
+    KB --> S2
+    KB --> SN
+    S1P1 -.->|"each row"| INS
+    S1 --> CNT
+    S2 --> CNT
+    SN --> CNT
+    ACC -.-> F1
+    ACC -.-> F2
+    ACC -.-> F3
+    ACC -.-> F4

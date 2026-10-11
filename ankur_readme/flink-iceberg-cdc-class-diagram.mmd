@@ -1,0 +1,360 @@
+classDiagram
+direction LR
+%% Flink -> Iceberg CDC / upsert sink: class diagram (Flink 2.3 module + Iceberg core)
+%% Companion write-up: how-iceberg-and-flink-cdc-work.md (Part 3)
+%% ---
+%% Packages:
+%%  org.apache.iceberg.flink              IcebergTableSink, FlinkDynamicTableFactory, FlinkWriteConf, TableLoader
+%%  org.apache.iceberg.flink.sink         IcebergSink and its operators, writer factory, delta writers
+%%  org.apache.iceberg.io (core)          BaseTaskWriter, BaseEqualityDeltaWriter, PartitioningDVWriter, WriteResult
+%%  org.apache.iceberg (api/core)         Table, RowDelta, AppendFiles, SnapshotProducer, TableOperations
+%% Arrows: <|-- extends, <|.. implements, *-- owns, --> uses / creates
+
+    %% ---------- SQL entry ----------
+    class FlinkDynamicTableFactory {
+        +createDynamicTableSink(context) DynamicTableSink
+        +createDynamicTableSource(context) DynamicTableSource
+    }
+    class IcebergTableSink {
+        -TableLoader tableLoader
+        -ResolvedSchema resolvedSchema
+        -boolean overwrite
+        +getSinkRuntimeProvider(context)
+        +getChangelogMode(requested) ChangelogMode
+        -PRIMARY KEY to equalityColumns
+    }
+    class DynamicTableSink {
+        <<interface>>
+    }
+    DynamicTableSink <|.. IcebergTableSink
+    FlinkDynamicTableFactory --> IcebergTableSink : creates
+    IcebergTableSink --> IcebergSink : use-v2-sink=true
+    IcebergTableSink --> FlinkSink : default
+
+    %% ---------- Sink V2 ----------
+    class Sink~RowData~ {
+        <<interface Flink>>
+    }
+    class IcebergSink {
+        -TableLoader tableLoader
+        -FlinkWriteConf flinkWriteConf
+        -Set~Integer~ equalityFieldIds
+        -boolean upsertMode
+        -RowType flinkRowType
+        +forRowData(DataStream) Builder$
+        +createWriter(context) SinkWriter
+        +createCommitter(context) Committer
+        +addPreWriteTopology(stream) DataStream
+        +addPreCommitTopology(stream) DataStream
+        +addPostCommitTopology(stream)
+        -distributeDataStream(input) DataStream
+    }
+    class IcebergSink_Builder {
+        +tableLoader(loader) Builder
+        +equalityFieldColumns(columns) Builder
+        +upsert(enabled) Builder
+        +distributionMode(mode) Builder
+        +writeParallelism(n) Builder
+        +append() DataStreamSink
+    }
+    Sink~RowData~ <|.. IcebergSink
+    IcebergSink *-- IcebergSink_Builder : static Builder
+    IcebergSink --> EqualityFieldKeySelector : keyBy (pre-write)
+    IcebergSink --> PartitionKeySelector : keyBy (pre-write)
+    IcebergSink --> IcebergSinkWriter : createWriter
+    IcebergSink --> IcebergWriteAggregator : pre-commit
+    IcebergSink --> IcebergCommitter : createCommitter
+    IcebergSink --> FlinkWriteConf : reads
+
+    class EqualityFieldKeySelector {
+        +getKey(RowData) Integer
+    }
+    class PartitionKeySelector {
+        +getKey(RowData) String
+    }
+    class FlinkWriteConf {
+        +upsertMode() boolean
+        +distributionMode() DistributionMode
+        +dataFileFormat() FileFormat
+        +targetDataFileSize() long
+        +overwriteMode() boolean
+    }
+    class TableLoader {
+        <<interface>>
+        +open()
+        +loadTable() Table
+    }
+    class CatalogTableLoader
+    TableLoader <|.. CatalogTableLoader
+    IcebergSink --> TableLoader
+
+    %% ---------- Writer operator ----------
+    class CommittingSinkWriter~RowData, WriteResult~ {
+        <<interface Flink>>
+    }
+    class IcebergSinkWriter {
+        -TaskWriterFactory taskWriterFactory
+        -TaskWriter~RowData~ writer
+        -IcebergStreamWriterMetrics metrics
+        +write(RowData, context)
+        +flush(endOfInput)
+        +prepareCommit() Collection~WriteResult~
+        +close()
+    }
+    CommittingSinkWriter~RowData, WriteResult~ <|.. IcebergSinkWriter
+    IcebergSinkWriter --> TaskWriterFactory : create() per checkpoint
+    IcebergSinkWriter --> WriteResult : emits
+
+    class TaskWriterFactory~T~ {
+        <<interface>>
+        +initialize(taskId, attemptId)
+        +create() TaskWriter~T~
+    }
+    class RowDataTaskWriterFactory {
+        -Set~Integer~ equalityFieldIds
+        -boolean upsert
+        -boolean useDv
+        -FileWriterFactory fileWriterFactory
+        -OutputFileFactory outputFileFactory
+        +create() TaskWriter~RowData~
+    }
+    TaskWriterFactory~T~ <|.. RowDataTaskWriterFactory
+    RowDataTaskWriterFactory --> FlinkFileWriterFactory : uses
+    RowDataTaskWriterFactory --> UnpartitionedWriter : no equality fields
+    RowDataTaskWriterFactory --> RowDataPartitionedFanoutWriter : no eq fields, partitioned
+    RowDataTaskWriterFactory --> UnpartitionedDeltaWriter : eq fields
+    RowDataTaskWriterFactory --> PartitionedDeltaWriter : eq fields, partitioned
+
+    class FlinkFileWriterFactory {
+        +newDataWriter(file, spec, partition)
+        +newEqualityDeleteWriter(file, spec, partition)
+        +newPositionDeleteWriter(file, spec, partition)
+    }
+    class RegistryBasedFileWriterFactory~T, S~ {
+        <<abstract>>
+    }
+    class FileWriterFactory~T~ {
+        <<interface>>
+    }
+    FileWriterFactory~T~ <|.. RegistryBasedFileWriterFactory~T, S~
+    RegistryBasedFileWriterFactory~T, S~ <|-- FlinkFileWriterFactory
+
+    %% ---------- Core task writers ----------
+    class TaskWriter~T~ {
+        <<interface>>
+        +write(T row)
+        +abort()
+        +complete() WriteResult
+    }
+    class BaseTaskWriter~T~ {
+        <<abstract core>>
+        #List~DataFile~ completedDataFiles
+        #List~DeleteFile~ completedDeleteFiles
+        #Set referencedDataFiles
+        -PartitioningDVWriter dvFileWriter
+        #dvFileWriter() PartitioningDVWriter
+        +complete() WriteResult
+    }
+    TaskWriter~T~ <|.. BaseTaskWriter~T~
+    class UnpartitionedWriter~T~
+    class PartitionedFanoutWriter~T~ {
+        <<abstract>>
+    }
+    class RowDataPartitionedFanoutWriter
+    BaseTaskWriter~T~ <|-- UnpartitionedWriter~T~
+    BaseTaskWriter~T~ <|-- PartitionedFanoutWriter~T~
+    PartitionedFanoutWriter~T~ <|-- RowDataPartitionedFanoutWriter
+
+    class BaseDeltaTaskWriter {
+        <<abstract>>
+        -Schema deleteSchema
+        -RowDataProjection keyProjection
+        -boolean upsert
+        +write(RowData) switch on RowKind
+        #route(RowData)* RowDataDeltaWriter
+    }
+    class UnpartitionedDeltaWriter {
+        -RowDataDeltaWriter writer
+        #route(RowData) RowDataDeltaWriter
+    }
+    class PartitionedDeltaWriter {
+        -Map~PartitionKey, RowDataDeltaWriter~ writers
+        #route(RowData) RowDataDeltaWriter
+    }
+    BaseTaskWriter~T~ <|-- BaseDeltaTaskWriter : T = RowData
+    BaseDeltaTaskWriter <|-- UnpartitionedDeltaWriter
+    BaseDeltaTaskWriter <|-- PartitionedDeltaWriter
+
+    class BaseEqualityDeltaWriter {
+        <<abstract inner, core>>
+        -RollingFileWriter dataWriter
+        -RollingEqDeleteWriter eqDeleteWriter
+        -PartitioningWriter posDeleteWriter
+        -Map~StructLike, PathOffset~ insertedRowMap
+        +write(T row)
+        +delete(T row)
+        +deleteKey(T key)
+        -internalPosDelete(key) boolean
+        +close()
+    }
+    class RowDataDeltaWriter {
+        <<inner>>
+        #asStructLike(RowData) StructLike
+        #asStructLikeKey(RowData) StructLike
+    }
+    BaseEqualityDeltaWriter <|-- RowDataDeltaWriter
+    UnpartitionedDeltaWriter *-- RowDataDeltaWriter : 1
+    PartitionedDeltaWriter *-- RowDataDeltaWriter : 1 per partition
+
+    class PartitioningWriter~T, R~ {
+        <<interface>>
+    }
+    class PartitioningDVWriter~T~ {
+        -DVFileWriter writer
+        +write(PositionDelete, spec, partition)
+        +result() DeleteWriteResult
+    }
+    class BaseDVFileWriter {
+        +delete(path, pos, spec, partition)
+        +result() DeleteWriteResult
+    }
+    PartitioningWriter~T, R~ <|.. PartitioningDVWriter~T~
+    PartitioningDVWriter~T~ *-- BaseDVFileWriter
+    BaseTaskWriter~T~ *-- PartitioningDVWriter~T~ : useDv (v3)
+    BaseEqualityDeltaWriter --> PartitioningDVWriter~T~ : position deletes (v3)
+
+    class WriteResult {
+        +dataFiles() DataFile[]
+        +deleteFiles() DeleteFile[]
+        +referencedDataFiles() CharSequence[]
+    }
+    BaseTaskWriter~T~ --> WriteResult : complete()
+
+    %% ---------- Pre-commit and commit ----------
+    class IcebergWriteAggregator {
+        -ManifestOutputFileFactory manifestOutputFileFactory
+        -Collection~WriteResult~ results
+        +processElement(CommittableMessage)
+        +prepareSnapshotPreBarrier(checkpointId)
+        +writeToManifest(results, checkpointId) byte[]
+    }
+    class AbstractStreamOperator {
+        <<Flink>>
+    }
+    AbstractStreamOperator <|-- IcebergWriteAggregator
+    IcebergWriteAggregator --> FlinkManifestUtil : writeCompletedFiles
+    IcebergWriteAggregator --> DeltaManifests : serializes
+    IcebergWriteAggregator --> IcebergCommittable : emits
+
+    class DeltaManifests {
+        -ManifestFile dataManifest
+        -ManifestFile deleteManifest
+        -CharSequence[] referencedDataFiles
+    }
+    class IcebergCommittable {
+        -byte[] manifest
+        -String jobId
+        -String operatorId
+        -long checkpointId
+    }
+    class FlinkManifestUtil {
+        +writeCompletedFiles(result, factory, spec) DeltaManifests$
+        +readCompletedFiles(manifests, io, specs) WriteResult$
+        +deleteCommittedManifests(table, manifests, jobId, ckpt)$
+    }
+
+    class Committer~IcebergCommittable~ {
+        <<interface Flink>>
+    }
+    class IcebergCommitter {
+        -Table table
+        -String branch
+        -int maxContinuousEmptyCommits
+        +commit(Collection~CommitRequest~)
+        -commitPendingRequests(...)
+        -commitDeltaTxn(pendingResults, summary, jobId, operatorId)
+        -commitOperation(op, desc, jobId, operatorId, ckpt)
+    }
+    Committer~IcebergCommittable~ <|.. IcebergCommitter
+    IcebergCommitter --> IcebergCommittable : consumes
+    IcebergCommitter --> FlinkManifestUtil : readCompletedFiles
+    IcebergCommitter --> SinkUtil : getMaxCommittedCheckpointId
+    IcebergCommitter --> RowDelta : CDC / upsert
+    IcebergCommitter --> AppendFiles : inserts only
+
+    class SinkUtil {
+        +MAX_COMMITTED_CHECKPOINT_ID$
+        +FLINK_JOB_ID$
+        +OPERATOR_ID$
+        +getMaxCommittedCheckpointId(table, jobId, opId, branch) long$
+    }
+
+    %% ---------- Iceberg table API ----------
+    class Table {
+        <<interface>>
+        +newAppend() AppendFiles
+        +newRowDelta() RowDelta
+        +currentSnapshot() Snapshot
+        +io() FileIO
+    }
+    class BaseTable {
+        -TableOperations ops
+    }
+    Table <|.. BaseTable
+    class SnapshotUpdate~T~ {
+        <<interface>>
+        +set(property, value)
+        +toBranch(branch)
+        +commit()
+    }
+    class RowDelta {
+        <<interface>>
+        +addRows(DataFile)
+        +addDeletes(DeleteFile)
+    }
+    class AppendFiles {
+        <<interface>>
+        +appendFile(DataFile)
+    }
+    SnapshotUpdate~T~ <|-- RowDelta
+    SnapshotUpdate~T~ <|-- AppendFiles
+    class SnapshotProducer~T~ {
+        <<abstract core>>
+        +commit() retry on CommitFailedException
+    }
+    class MergingSnapshotProducer~T~ {
+        <<abstract core>>
+    }
+    class BaseRowDelta
+    class FastAppend
+    SnapshotProducer~T~ <|-- MergingSnapshotProducer~T~
+    MergingSnapshotProducer~T~ <|-- BaseRowDelta
+    RowDelta <|.. BaseRowDelta
+    SnapshotProducer~T~ <|-- FastAppend
+    AppendFiles <|.. FastAppend
+    class TableOperations {
+        <<interface>>
+        +current() TableMetadata
+        +refresh() TableMetadata
+        +commit(base, metadata)
+    }
+    BaseTable --> TableOperations
+    SnapshotProducer~T~ --> TableOperations : commit(base, new)
+
+    %% ---------- Legacy sink ----------
+    class FlinkSink {
+        +forRowData(DataStream) Builder$
+    }
+    class IcebergStreamWriter~T~ {
+        +processElement(record)
+        +prepareSnapshotPreBarrier(ckpt)
+    }
+    class IcebergFilesCommitter {
+        +snapshotState(context)
+        +notifyCheckpointComplete(ckpt)
+    }
+    FlinkSink --> IcebergStreamWriter~T~ : N subtasks
+    FlinkSink --> IcebergFilesCommitter : parallelism 1
+    IcebergStreamWriter~T~ --> TaskWriterFactory~T~ : same writer core
+    AbstractStreamOperator <|-- IcebergStreamWriter~T~
+    AbstractStreamOperator <|-- IcebergFilesCommitter

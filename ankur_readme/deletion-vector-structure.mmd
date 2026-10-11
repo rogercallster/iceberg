@@ -1,0 +1,72 @@
+flowchart LR
+%% Iceberg v3 deletion vectors (DVs): what they are, how they are stored, written, read and replaced
+%% Companion write-up: deletion-vectors-and-flink-upsert.md
+%% ---
+%% Key facts (verified in core/):
+%%  - A DV is a roaring bitmap of deleted ROW POSITIONS for exactly ONE data file
+%%  - Stored as a blob of type "deletion-vector-v1" inside a Puffin file; many DVs can share one Puffin file
+%%  - Each DV is still its own DeleteFile entry in a delete manifest (format PUFFIN, content_offset, content_size)
+%%  - At most one DV per data file in a snapshot; a new DV must merge the old one and replace it
+%%  - v3 forbids position delete files ("Must use DVs for position deletes in V3")
+
+    subgraph DATA["Data file A (Parquet)"]
+        direction TB
+        ROWS["pos 0 · id=10 'x'<br/>pos 1 · id=11 'y'  ✗<br/>pos 2 · id=12 'z'<br/>pos 3 · id=13 'w'  ✗<br/>pos 4 · id=14 'v'<br/>pos 5 · id=15 'u'<br/>pos 6 · id=16 't'  ✗<br/>pos 7 · id=17 's'<br/>(✗ = deleted, file itself never rewritten)"]
+    end
+
+    subgraph BITMAP["Deletion vector for file A"]
+        direction TB
+        BITS["Bitmap over row positions<br/>0 1 0 1 0 0 1 0<br/>set = {1, 3, 6}<br/>cardinality = 3"]
+        ROAR["RoaringPositionBitmap<br/>64-bit positions<br/>high 32 bits -> RoaringBitmap per key<br/>runs / arrays / bitsets compress well"]
+        SER["Serialized blob (BitmapPositionDeleteIndex)<br/>4 B length (big-endian)<br/>4 B magic D1 D3 39 64<br/>portable Roaring bytes<br/>4 B CRC-32 (big-endian)"]
+        BITS --> ROAR --> SER
+    end
+
+    subgraph PUFFIN["Puffin file  dv-00001.puffin  (one per writer flush)"]
+        direction TB
+        MAG["Magic 'PFA1'"]
+        B1["Blob 1 · deletion-vector-v1<br/>referenced-data-file = A<br/>cardinality = 3"]
+        B2["Blob 2 · deletion-vector-v1<br/>referenced-data-file = B<br/>cardinality = 120"]
+        B3["Blob N · deletion-vector-v1<br/>referenced-data-file = ..."]
+        FOOT["Footer JSON<br/>blob offsets, lengths, properties"]
+        MAG --> B1 --> B2 --> B3 --> FOOT
+    end
+
+    subgraph MANIFEST["Delete manifest entries (one DeleteFile per DV)"]
+        direction TB
+        E1["DeleteFile #1<br/>content = POSITION_DELETES<br/>format = PUFFIN<br/>path = dv-00001.puffin<br/>referenced_data_file = A<br/>content_offset / content_size_in_bytes<br/>record_count = 3"]
+        E2["DeleteFile #2<br/>same Puffin path<br/>referenced_data_file = B<br/>different offset / size"]
+    end
+
+    subgraph READ["Read path"]
+        direction TB
+        PLAN["Scan planning (DeleteFileIndex)<br/>data file A -> its single DV<br/>exact match on referenced_data_file<br/>no per-file filtering needed"]
+        LOAD["Reader seeks to content_offset<br/>reads content_size bytes<br/>deserializes bitmap"]
+        SKIP["While reading A:<br/>skip rows whose position is in bitmap<br/>emit rows 0, 2, 4, 5, 7"]
+        PLAN --> LOAD --> SKIP
+    end
+
+    subgraph UPDATE["Later delete on file A (new snapshot)"]
+        direction TB
+        NEWDEL["New deletes for A: {4}"]
+        MERGE["BaseDVFileWriter.close()<br/>loadPreviousDeletes(A) = {1,3,6}<br/>merge -> {1,3,4,6}"]
+        REPL["Commit new DV for A<br/>old DV recorded as rewritten<br/>-> removed from table state"]
+        NEWDEL --> MERGE --> REPL
+    end
+
+    subgraph V2["Compare: v2 position delete file"]
+        direction TB
+        PDF["pos-delete.parquet<br/>rows of (file_path, pos)<br/>(A,1) (A,3) (A,6) (B,...) ...<br/>may cover many data files"]
+        PCOST["Reader must read and filter by file_path<br/>many small files accumulate<br/>several pos-delete files can target one data file"]
+        PDF --> PCOST
+    end
+
+    ROWS -->|"deleted positions 1, 3, 6"| BITS
+    SER -->|"written as"| B1
+    B1 -->|"tracked by"| E1
+    B2 -->|"tracked by"| E2
+    E1 --> PLAN
+    LOAD -->|"reads"| B1
+    SKIP -.->|"applied to"| ROWS
+    REPL -->|"replaces"| E1
+    BITMAP ~~~ V2

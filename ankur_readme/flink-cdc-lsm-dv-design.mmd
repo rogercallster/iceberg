@@ -1,0 +1,110 @@
+flowchart LR
+%% PROPOSAL: Paimon-style bucketed LSM writer for Flink CDC/upsert into Iceberg v3
+%% Companion write-up: flink-cdc-lsm-dv-proposal.md
+%% ---
+%% Goal: zero equality deletes, at most one DV per data file, bounded DV cardinality via in-writer compaction.
+%% Core idea (from Paimon primary-key tables): each bucket has exactly ONE writer that owns
+%%   (a) the primary-key index for the bucket, (b) the current DV bitmap of every file in the bucket,
+%%   (c) the LSM levels of the bucket. Owning all three removes the need for equality deletes.
+%% Reuses: BaseDVFileWriter, RowDelta.removeDeletes, RewriteFiles, ideas from EqualityConvertPKIndex.
+
+    subgraph TODAY["Today (BaseDeltaTaskWriter, upsert)"]
+        direction TB
+        T1["keyBy(pk), every subtask touches every partition"]
+        T2["key not written this checkpoint<br/>-> equality-delete ROW"]
+        T3["eq-delete files ≈ subtasks x partitions<br/>per checkpoint, ~1 row each<br/>readers apply each to all older files"]
+        T1 --> T2 --> T3
+    end
+
+    subgraph SRC["1 · CDC input"]
+        direction TB
+        CDC["Flink CDC / Kafka<br/>+I / -U / +U / -D"]
+    end
+
+    subgraph ASSIGN["2 · Bucket assignment (pre-write topology)"]
+        direction TB
+        SPEC["Table spec: bucket(B, pk)<br/>(+ optional day(ts))<br/>B fixed, e.g. 1024"]
+        BA["BucketPartitioner<br/>bucket = murmur3(pk) mod B<br/>subtask = bucket mod N<br/>stable single owner per bucket"]
+        SPEC --> BA
+    end
+
+    subgraph WRITER["3 · LSM writer subtask (owns buckets b where b mod N = i)"]
+        direction TB
+        BUF["Sort buffer per bucket<br/>dedupe by pk in memory<br/>(last write wins / merge engine)"]
+        LOOK{"PK index lookup<br/>where is pk's live row?"}
+        NEW["Not found<br/>-> plain insert<br/>NO delete written"]
+        OLD["Found in committed file F @ pos p<br/>-> set bit p in DV(F)<br/>(owner holds current bitmap)"]
+        CUR["Found in this checkpoint's buffer<br/>-> replaced in memory<br/>(never reaches a file)"]
+        L0["Flush at checkpoint:<br/>L0 file per bucket, sorted by pk<br/>+ Parquet bloom filter on pk"]
+        BUF --> LOOK
+        LOOK -->|"new key"| NEW
+        LOOK -->|"older checkpoint"| OLD
+        LOOK -->|"same checkpoint"| CUR
+        NEW --> L0
+        OLD --> L0
+        CUR --> L0
+    end
+
+    subgraph STATE["Writer state (Flink checkpointed)"]
+        direction TB
+        IDX["PK index per bucket<br/>Option A: RocksDB pk -> (fileId, pos)<br/>Option B: lookup in sorted levels<br/>(key range + bloom + page index)"]
+        DVS["Current DV bitmap per owned file<br/>RoaringPositionBitmap"]
+        LVL["Level manifest per bucket<br/>file -> level, key range, live ratio"]
+    end
+
+    subgraph COMPACT["4 · In-writer LSM compaction (async, per bucket)"]
+        direction TB
+        TRIG["Triggers<br/>L0 files > 4<br/>file live ratio < 70%<br/>size amplification > 2x"]
+        MERGE["Merge-sort chosen runs by pk<br/>drop rows whose DV bit is set<br/>write new L1/L2 files, non-overlapping"]
+        REIDX["Update index for moved keys<br/>clear DVs of rewritten files"]
+        TRIG --> MERGE --> REIDX
+    end
+
+    subgraph LEVELS["Per-bucket LSM layout (all plain Iceberg data files)"]
+        direction TB
+        LV0["L0: small sorted runs<br/>one per checkpoint"]
+        LV1["L1: medium files<br/>non-overlapping key ranges"]
+        LV2["L2: large files<br/>non-overlapping, few DV bits"]
+        LV0 -->|"compact"| LV1 -->|"compact"| LV2
+    end
+
+    subgraph COMMIT["5 · Commit per checkpoint (IcebergCommitter, extended)"]
+        direction TB
+        RD["RowDelta<br/>addRows(L0 files)<br/>addDeletes(new merged DVs)<br/>removeDeletes(old DVs of same files)<br/>NO equality deletes"]
+        RW["RewriteFiles (when compaction finished)<br/>deleteFile(old data + DVs)<br/>addFile(new L1/L2 files)"]
+        VAL["validateFromSnapshot(last)<br/>conflictDetectionFilter(bucket in owned)<br/>validateNoConflictingDeleteFiles()"]
+        RD --> VAL
+        RW --> VAL
+    end
+
+    subgraph TABLE["6 · Iceberg v3 table"]
+        direction TB
+        TB1[("Data files<br/>bounded count per bucket")]
+        TB2[("DVs: ≤ 1 per data file<br/>one Puffin per writer per commit<br/>cardinality reset by compaction")]
+        TB3[("Equality deletes: 0")]
+    end
+
+    subgraph READ["7 · Any v3 reader (Spark, Trino, Flink)"]
+        direction TB
+        RR["data file + its single DV<br/>no equality-delete join<br/>no merge-on-read sorting"]
+    end
+
+    CDC --> BA
+    BA -->|"rows of owned buckets"| BUF
+    LOOK <-.->|"get / put"| IDX
+    OLD -.->|"update bitmap"| DVS
+    L0 -.->|"register L0"| LVL
+    LVL -.-> TRIG
+    REIDX -.-> IDX
+    REIDX -.-> DVS
+    REIDX -.-> LVL
+    MERGE -.-> LEVELS
+    L0 --> RD
+    DVS -->|"touched files only"| RD
+    MERGE --> RW
+    VAL --> TB1
+    VAL --> TB2
+    VAL --> TB3
+    TB1 --> RR
+    TB2 --> RR
+    TODAY ~~~ SRC

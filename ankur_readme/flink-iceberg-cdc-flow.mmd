@@ -1,0 +1,90 @@
+sequenceDiagram
+%% Flink CDC -> Iceberg: end-to-end flow for one checkpoint (IcebergSink / Sink V2, Flink 2.3 module)
+%% Companion write-up: how-iceberg-and-flink-cdc-work.md (Part 2)
+%% ---
+%% Phases:
+%%  A. Per-row write (continuous): RowKind switch -> data rows, position deletes, equality deletes
+%%  B. Checkpoint barrier: writers close files -> WriteResult -> aggregator writes temp manifests
+%%  C. Checkpoint complete: committer turns manifests into an Iceberg RowDelta snapshot (exactly-once)
+%% Example stream (upsert mode, key = id): +I(1,a), +I(1,b), -D(2) where id=2 was written in an earlier checkpoint
+
+    autonumber
+    participant SRC as CDC Source<br/>(Flink CDC / Kafka)
+    participant KEY as keyBy<br/>EqualityFieldKeySelector
+    participant SW as IcebergSinkWriter<br/>(subtask i of N)
+    participant DTW as BaseDeltaTaskWriter<br/>(PartitionedDeltaWriter)
+    participant EQW as BaseEqualityDeltaWriter<br/>(per partition)
+    participant FS as Object store<br/>(FileIO)
+    participant AGG as IcebergWriteAggregator<br/>(parallelism 1)
+    participant CMT as IcebergCommitter<br/>(subtask 0)
+    participant TBL as Table / TableOperations
+    participant CAT as Catalog<br/>(REST / Hive / Glue)
+
+    rect rgb(235, 245, 255)
+    Note over SRC,FS: A. Per-row write (between checkpoints)
+    SRC->>KEY: RowData +I (1,'a')
+    KEY->>SW: hash(id=1) -> subtask i
+    SW->>DTW: write(row)
+    DTW->>DTW: route(row) -> partition writer
+    DTW->>EQW: upsert: deleteKey(key 1)
+    EQW->>EQW: insertedRowMap.remove(1) = null
+    EQW->>FS: equality delete {id=1} (eq-delete file)
+    DTW->>EQW: write(row)
+    EQW->>EQW: insertedRowMap.put(1, file A @ 0)
+    EQW->>FS: append (1,'a') to data file A
+
+    SRC->>KEY: RowData +I (1,'b')
+    KEY->>SW: same key -> same subtask i
+    SW->>DTW: write(row)
+    DTW->>EQW: upsert: deleteKey(key 1)
+    EQW->>EQW: insertedRowMap.remove(1) = file A @ 0
+    EQW->>FS: position delete (A, 0)<br/>v2: pos-delete file / v3: DV bitmap
+    DTW->>EQW: write(row)
+    EQW->>EQW: insertedRowMap.put(1, file A @ 1)
+    EQW->>FS: append (1,'b') to data file A
+
+    SRC->>KEY: RowData -D (2)
+    KEY->>SW: hash(id=2) -> subtask j (may differ)
+    SW->>DTW: write(row)
+    DTW->>EQW: upsert: deleteKey(key 2)
+    EQW->>EQW: insertedRowMap.remove(2) = null (older checkpoint)
+    EQW->>FS: equality delete {id=2}
+    end
+
+    rect rgb(255, 245, 230)
+    Note over SW,AGG: B. Checkpoint barrier n arrives
+    SW->>DTW: prepareCommit() -> complete()
+    DTW->>EQW: close(): flush data, eq-delete, pos-delete / DV writers
+    EQW->>FS: finish files (Parquet footers, Puffin)
+    DTW-->>SW: WriteResult {dataFiles, deleteFiles, referencedDataFiles}
+    SW-->>AGG: CommittableWithLineage(WriteResult) from every subtask
+    AGG->>AGG: prepareSnapshotPreBarrier(n): merge all results
+    AGG->>FS: write temp data manifest + delete manifest (DeltaManifests)
+    AGG-->>CMT: IcebergCommittable {manifest bytes, jobId, operatorId, checkpointId=n}
+    Note over AGG,CMT: Flink snapshots operator state, checkpoint n completes
+    end
+
+    rect rgb(235, 255, 235)
+    Note over CMT,CAT: C. notifyCheckpointComplete(n) -> commit
+    CMT->>TBL: getMaxCommittedCheckpointId(jobId, operatorId, branch)
+    TBL-->>CMT: last committed = n-1 (skip anything <= it on restore)
+    CMT->>FS: readCompletedFiles(DeltaManifests)
+    alt no delete files
+        CMT->>TBL: newAppend().appendFile(...)
+    else has delete files (CDC / upsert)
+        loop one RowDelta per pending checkpoint, in order
+            CMT->>TBL: newRowDelta().addRows(data).addDeletes(deletes)
+        end
+    end
+    CMT->>TBL: set flink.max-committed-checkpoint-id=n, flink.job-id, flink.operator-id
+    TBL->>FS: write manifests, manifest list, new metadata.json
+    TBL->>CAT: commit(base, new): atomic swap of metadata pointer
+    alt CAS succeeds
+        CAT-->>TBL: ok -> snapshot visible to readers
+    else concurrent commit (CommitFailedException)
+        TBL->>TBL: refresh(), re-apply on new base, retry
+    end
+    CMT->>FS: deleteCommittedManifests (temp Flink manifests)
+    end
+
+    Note over TBL: Optional post-commit: TableMaintenance<br/>(ConvertEqualityDeletes, RewriteDataFiles, ExpireSnapshots)
